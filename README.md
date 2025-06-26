@@ -27,7 +27,7 @@
                                                          +-----------------------+
 ```
 
-1.  **规则工厂 (`batch_generate_protocol_analysis_and_rules_v2.py`)**: 读取 Wireshark 的 C 语言解析器源码，利用 Gemini AI 深度分析协议的识别逻辑、端口和关键结构，自动生成符合本框架规范的 Python 解析器文件。
+1.  **规则工厂 (`batch_generate_protocol_analysis_and_detectors_v2.py`)**: 读取 Wireshark 的 C 语言解析器源码，利用 Gemini AI 深度分析协议的识别逻辑、端口和关键结构，自动生成符合本框架规范的 Python 解析器文件。
 2.  **检测引擎 (`traffic_detector_v2.py`)**: 一个高性能的实时流量嗅探器。它动态加载 `detectors` 目录下的所有 Python 解析器，并利用它们来识别和解析实时网络流量，最终输出结构化的日志。
 
 ## 主要特性

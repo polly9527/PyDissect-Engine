@@ -1,0 +1,4 @@
+google-generativeai
+pcapy
+dpkt
+python-dotenv

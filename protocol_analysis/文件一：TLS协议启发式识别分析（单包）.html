@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>TLS协议启发式识别分析（单包）</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; line-height: 1.6; color: #333; max-width: 960px; margin: 20px auto; padding: 0 20px; }
+        h1, h2, h3 { color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; }
+        h1 { text-align: center; }
+        code { background-color: #f4f4f4; padding: 2px 6px; border-radius: 4px; font-family: "Courier New", Courier, monospace; }
+        pre { background-color: #f4f4f4; padding: 15px; border-radius: 5px; overflow-x: auto; border-left: 5px solid #3498db; }
+        table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #3498db; color: white; }
+        .mermaid {
+            background-color: #f9f9f9;
+            border: 1px solid #ddd;
+            padding: 15px;
+            border-radius: 5px;
+            text-align: center;
+            font-family: "Courier New", Courier, monospace;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>TLS协议启发式识别分析（单包）</h1>
+
+    <p>该分析基于 <code>packet-tls.c</code> 源代码，重点关注在没有端口号提示的情况下，仅通过单个数据包内容来判断其是否为TLS/SSL流量的启发式检测逻辑。该逻辑主要由 <code>dissect_ssl_heur</code> 函数及其调用的子函数实现。</p>
+
+    <h2>1. Mermaid 流程图</h2>
+    <p>以下是根据 <code>dissect_ssl_heur</code>, <code>is_sslv3_or_tls</code>, 和 <code>is_sslv2_clienthello</code> 函数逻辑生成的Mermaid流程图伪代码。它描述了单包启发式检测的核心步骤。</p>
+    <div class="mermaid">
+        <pre>
+graph TD
+    A[开始: dissect_ssl_heur接收TCP载荷] --> B{is_sslv3_or_tls ?};
+    B -- 是 --> C{判定为TLS流量};
+    B -- 否 --> D{is_sslv2_clienthello ?};
+    D -- 是 --> C;
+    D -- 否 --> E[判定为非TLS流量];
+
+    subgraph is_sslv3_or_tls
+        direction LR
+        S1[载荷长度是否 >= 5字节?] --> S2{Content Type是否为<br>Handshake (22) 或<br>Application Data (23)?<br>偏移量: 0, 长度: 1};
+        S2 -- 是 --> S3{协议版本是否为<br>SSLv3 (0x0300), TLS 1.0 (0x0301),<br>TLS 1.1 (0x0302), TLS 1.2 (0x0303)?<br>偏移量: 1, 长度: 2};
+        S3 -- 是 --> S4{Record Length是否<br> > 0 且 < 16384 + 2048?<br>偏移量: 3, 长度: 2};
+        S4 -- 是 --> S5[返回 True];
+        S1 -- 否 --> S6[返回 False];
+        S2 -- 否 --> S6;
+        S3 -- 否 --> S6;
+        S4 -- 否 --> S6;
+    end
+
+    subgraph is_sslv2_clienthello
+        direction LR
+        V1[载荷长度是否 >= 46字节?] --> V2{第1个字节是否为 0x80?<br>偏移量: 0, 长度: 1};
+        V2 -- 是 --> V3{msg_type是否为 1 (Client Hello)?<br>偏移量: 2, 长度: 1};
+        V3 -- 是 --> V4{cipher_spec_length是否<br>> 0 且为3的倍数?<br>偏移量: 5, 长度: 2};
+        V4 -- 是 --> V5{session_id_length是否<br>为 0 或 16?<br>偏移量: 7, 长度: 2};
+        V5 -- 是 --> V6{challenge_length是否为 32?<br>偏移量: 9, 长度: 2};
+        V6 -- 是 --> V7[返回 True];
+        V1 -- 否 --> V8[返回 False];
+        V2 -- 否 --> V8;
+        V3 -- 否 --> V8;
+        V4 -- 否 --> V8;
+        V5 -- 否 --> V8;
+        V6 -- 否 --> V8;
+    end
+        </pre>
+    </div>
+
+    <h2>2. 关键宏定义</h2>
+    <p>启发式检测函数中使用了一些关键的宏和常量来识别协议特征。</p>
+    <table>
+        <thead>
+            <tr>
+                <th>宏/常量名称</th>
+                <th>值 (十进制)</th>
+                <th>值 (十六进制)</th>
+                <th>说明</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>SSL_ID_HANDSHAKE</code></td>
+                <td>22</td>
+                <td>0x16</td>
+                <td>标识内容为握手协议消息的内容类型。</td>
+            </tr>
+            <tr>
+                <td><code>SSL_ID_APP_DATA</code></td>
+                <td>23</td>
+                <td>0x17</td>
+                <td>标识内容为应用数据的类型。</td>
+            </tr>
+            <tr>
+                <td><code>SSLV3_VERSION</code></td>
+                <td>768</td>
+                <td>0x0300</td>
+                <td>SSL 3.0 的协议版本号。</td>
+            </tr>
+            <tr>
+                <td><code>TLSV1_VERSION</code></td>
+                <td>769</td>
+                <td>0x0301</td>
+                <td>TLS 1.0 的协议版本号。</td>
+            </tr>
+             <tr>
+                <td><code>TLSV1DOT1_VERSION</code></td>
+                <td>770</td>
+                <td>0x0302</td>
+                <td>TLS 1.1 的协议版本号。</td>
+            </tr>
+            <tr>
+                <td><code>TLSV1DOT2_VERSION</code></td>
+                <td>771</td>
+                <td>0x0303</td>
+                <td>TLS 1.2 的协议版本号。</td>
+            </tr>
+            <tr>
+                <td><code>TLS_MAX_RECORD_LENGTH</code></td>
+                <td>16384</td>
+                <td>0x4000</td>
+                <td>TLS 记录层载荷的最大长度。</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h2>3. 检测方法总结</h2>
+    <p>从网络流量的角度来看，该启发式检测方法是一种“特征匹配”技术。它不依赖于任何先验知识（如TCP/UDP端口号），而是直接检查TCP载荷的前几个字节，判断其是否符合两种已知的TLS/SSL协议格式之一：</p>
+    <ol>
+        <li>
+            <strong>TLS V1.x / SSL V3.0 记录层格式</strong>:
+            <ul>
+                <li>它首先检查数据包是否足够长（至少5个字节），以包含一个完整的记录头。</li>
+                <li>然后检查第一个字节是否为特定的<strong>内容类型</strong>（通常是握手类型`22`或应用数据类型`23`）。</li>
+                <li>接着，检查接下来的两个字节所代表的<strong>协议版本</strong>是否在已知的SSLv3/TLS版本范围内（如`0x0301`代表TLS 1.0）。</li>
+                <li>最后，检查记录头中声明的<strong>长度</strong>字段是否在一个合理的范围内，防止将随机数据误判为TLS。</li>
+            </ul>
+        </li>
+        <li>
+            <strong>SSL V2.0 兼容的客户端问候（Client Hello）格式</strong>:
+            <ul>
+                <li>它检查数据包是否足够长（至少46字节）以包含一个最小的SSLv2 Client Hello。</li>
+                <li>它会验证一系列固定偏移量上的字段是否具有特定的值或满足特定条件，例如消息类型必须为`1`，密码套件长度必须是3的倍数，Challenge长度必须为32字节等。这是一种非常精确的特征匹配。</li>
+            </ul>
+        </li>
+    </ol>
+    <p>只要满足上述两种格式中任意一种的特征，该数据包就会被判定为TLS/SSL流量，并交由完整的TLS解析器进行处理。</p>
+    <p><strong>符合检测逻辑的16进制样例 (TLS 1.2 Client Hello 记录头):</strong></p>
+    <pre>16 03 03 00 51 ...</pre>
+    <ul>
+        <li><code>16</code>: Content Type，表示 Handshake (22)。</li>
+        <li><code>03 03</code>: Version，表示 TLS 1.2 (0x0303)。</li>
+        <li><code>00 51</code>: Length，表示记录层后续的数据长度为 81 字节。</li>
+    </ul>
+
+    <h2>4. 启发式函数源码</h2>
+    <p>以下是从 <code>packet-tls.c</code> 中提取的与启发式检测直接相关的函数源代码。</p>
+    <pre><code>
+static bool
+is_sslv3_or_tls(tvbuff_t *tvb)
+{
+    uint8_t             content_type;
+    uint16_t            protocol_version, record_length;
+
+    /*
+     * Heuristics should match the TLS record header.
+     * ContentType (1), ProtocolVersion (2), Length (2)
+     *
+     * We do not check for an actual payload, IBM WebSphere is known
+     * to separate the record header and payload over two separate packets.
+     */
+    if (tvb_captured_length(tvb) < 5) {
+        return false;
+    }
+
+    content_type = tvb_get_uint8(tvb, 0);
+    protocol_version = tvb_get_ntohs(tvb, 1);
+    record_length = tvb_get_ntohs(tvb, 3);
+
+    /* These are the common types. */
+    if (content_type != SSL_ID_HANDSHAKE && content_type != SSL_ID_APP_DATA) {
+        return false;
+    }
+
+    /*
+     * Match SSLv3, TLS 1.0/1.1/1.2 (TLS 1.3 uses same value as TLS 1.0). Most
+     * likely you'll see 0x300 (SSLv3) or 0x301 (TLS 1.1) for interoperability
+     * reasons. Per RFC 5246 we should accept any 0x3xx value, but this is just
+     * a heuristic that catches common/likely cases.
+     */
+    if (protocol_version != SSLV3_VERSION &&
+        protocol_version != TLSV1_VERSION &&
+        protocol_version != TLSV1DOT1_VERSION &&
+        protocol_version != TLSV1DOT2_VERSION &&
+        protocol_version != TLCPV1_VERSION ) {
+        return false;
+    }
+
+    /* Check for sane length, see also ssl_check_record_length in packet-tls-utils.c */
+    if (record_length == 0 || record_length >= TLS_MAX_RECORD_LENGTH + 2048) {
+        return false;
+    }
+
+    return true;
+}
+
+static bool
+is_sslv2_clienthello(tvbuff_t *tvb)
+{
+    /*
+     * Detect SSL 2.0 compatible Client Hello as used in SSLv3 and TLS.
+     *
+     * https://tools.ietf.org/html/rfc5246#appendix-E.2
+     * ...
+     */
+    if (tvb_captured_length(tvb) < 46) {
+        return false;
+    }
+
+    /* Assume that message length is less than 256 (at most 64 cipherspecs). */
+    if (tvb_get_uint8(tvb, 0) != 0x80) {
+        return false;
+    }
+
+    /* msg_type must be 1 for Client Hello */
+    if (tvb_get_uint8(tvb, 2) != 1) {
+        return false;
+    }
+
+    /* cipher spec length must be a non-zero multiple of 3 */
+    uint16_t cipher_spec_length = tvb_get_ntohs(tvb, 5);
+    if (cipher_spec_length == 0 || cipher_spec_length % 3 != 0) {
+        return false;
+    }
+
+    /* session ID length must be 0 or 16 in TLS 1.0 */
+    uint16_t session_id_length = tvb_get_ntohs(tvb, 7);
+    if (session_id_length != 0 && session_id_length != 16) {
+        return false;
+    }
+
+    /* Challenge Length must be 32 */
+    if (tvb_get_ntohs(tvb, 9) != 32) {
+        return false;
+    }
+
+    return true;
+}
+
+static bool
+dissect_ssl_heur(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data)
+{
+    conversation_t     *conversation;
+
+    if (!is_sslv3_or_tls(tvb) && !is_sslv2_clienthello(tvb)) {
+        return false;
+    }
+
+    conversation = find_or_create_conversation(pinfo);
+    conversation_set_dissector_from_frame_number(conversation, pinfo->num, tls_handle);
+    return dissect_ssl(tvb, pinfo, tree, data) > 0;
+}
+    </code></pre>
+</body>
+</html>

@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>QUIC解析器高级功能分析</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            margin: 20px;
+            background-color: #f4f4f4;
+            color: #333;
+        }
+        h1, h2, h3 {
+            color: #0056b3;
+        }
+        pre {
+            background-color: #eee;
+            border: 1px solid #ddd;
+            padding: 15px;
+            overflow-x: auto;
+            border-radius: 5px;
+        }
+        .section {
+            background-color: #fff;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+        ul {
+            list-style-type: disc;
+            margin-left: 20px;
+        }
+        li {
+            margin-bottom: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="section">
+        <h1>QUIC解析器高级功能分析</h1>
+        <p>Wireshark 的 QUIC 解析器不仅仅是识别协议，它还实现了多种高级功能，以应对 QUIC 协议的复杂性，包括连接跟踪、解密、流重组和多路径支持。本文件将详细分析这些高级功能的背景、实现原理和代码逻辑。</p>
+    </div>
+
+    <div class="section">
+        <h2>1. 背景</h2>
+        <p>QUIC (Quick UDP Internet Connections) 是一种基于 UDP 的多路复用和安全传输协议，旨在提高性能和可靠性。其关键特性包括：</p>
+        <ul>
+            <li><strong>基于 UDP：</strong> 避免了 TCP 队头阻塞，并允许在用户空间实现拥塞控制和可靠性。</li>
+            <li><strong>内置 TLS 1.3 加密：</strong> 所有数据（包括握手）默认加密，提供了前向保密和防止篡改。</li>
+            <li><strong>多路复用流：</strong> 允许在单个连接上同时传输多个独立的流，避免了流之间的队头阻塞。</li>
+            <li><strong>连接迁移：</strong> 允许连接在不同的 IP 地址和端口之间无缝迁移，而不会中断活动传输。</li>
+            <li><strong>版本协商：</strong> 支持平滑过渡到新版本的协议。</li>
+        </ul>
+        <p>这些特性为协议解析带来了独特的挑战：</p>
+        <ul>
+            <li><strong>加密：</strong> 大部分 QUIC 报文内容是加密的，需要 TLS 密钥日志或外部密钥才能解密。</li>
+            <li><strong>连接跟踪：</strong> QUIC 使用 Connection ID 来识别连接，而不是传统的 IP 地址和端口对，且 Connection ID 可以变化和迁移。</li>
+            <li><strong>乱序和重传：</strong> QUIC 运行在 UDP 之上，需要处理报文乱序、丢失和重传，并对流数据进行重组。</li>
+            <li><strong>多路径：</strong> 较新的 QUIC 草案支持多路径，进一步增加了连接管理的复杂性。</li>
+        </ul>
+    </div>
+
+    <div class="section">
+        <h2>2. 实现原理</h2>
+
+        <h3>2.1. 连接跟踪 (Connection Tracking)</h3>
+        <p>QUIC 解析器通过维护一个全局的连接状态表来跟踪 QUIC 连接。每个 QUIC 连接由一个或多个 Connection ID (CID) 标识。当报文到达时，解析器会尝试根据报文中的 Destination Connection ID (DCID) 和 Source Connection ID (SCID) 来匹配现有连接，或者创建新的连接。</p>
+        <p><strong>关键数据结构：</strong></p>
+        <ul>
+            <li><code>quic_info_data_t</code>: 表示一个 QUIC 连接的完整信息，包括连接号、版本、客户端/服务器地址和端口、TLS 加密参数、各加密级别的 Packet Number 空间、Connection ID 列表、流信息等。</li>
+            <li><code>quic_cid_item_t</code>: 存储单个 Connection ID 及其相关数据 (如序列号、路径 ID)。</li>
+            <li><code>wmem_map_t *quic_client_connections</code>, <code>*quic_server_connections</code>, <code>*quic_initial_connections</code>: 全局映射，用于快速通过 CID 查找连接。</li>
+        </ul>
+        <p><strong>代码逻辑：</strong></p>
+        <pre>
+/* QUIC Connection tracking. {{{ */
+static unsigned
+quic_connection_hash(const void *key) { ... } // CID哈希函数
+
+static gboolean
+quic_connection_equal(const void *a, const void *b) { ... } // CID相等比较函数
+
+static gboolean
+quic_cids_has_match(const quic_cid_item_t *items, quic_cid_t *raw_cid) { ... } // 检查CID是否匹配
+
+static void
+quic_cids_insert(quic_cid_t *cid, quic_info_data_t *conn, bool from_server) { ... } // 插入CID到连接映射
+
+static quic_info_data_t *
+quic_connection_from_conv(packet_info *pinfo) { ... } // 从会话查找连接
+
+static quic_info_data_t *
+quic_connection_find_dcid(packet_info *pinfo, quic_cid_t *dcid, bool *from_server) { ... } // 根据DCID查找连接
+
+static quic_info_data_t *
+quic_connection_find(packet_info *pinfo, uint8_t long_packet_type, quic_cid_t *dcid, bool *from_server) {
+    // 查找逻辑：优先尝试 0-RTT 包匹配 Initial SCID/DCID
+    // 然后尝试根据 DCID 在客户端或服务器连接表中查找
+    // 对于 Short Header 包，如果没有匹配，则尝试根据五元组查找，并迭代匹配已知 CID 长度
+    // 处理连接迁移时，会将新的 UDP 会话关联到现有的 QUIC 连接
+}
+
+static quic_info_data_t *
+quic_connection_create(packet_info *pinfo, uint32_t version) {
+    // 创建新的quic_info_data_t结构
+    // 关联到会话
+    // 根据版本信息初始化gquic_info (如果适用)
+}
+
+static void
+quic_connection_update_initial(quic_info_data_t *conn, const quic_cid_t *scid, const quic_cid_t *dcid) {
+    // 更新客户端初始 CID 和 DCID
+    // 将其插入到连接映射中
+}
+
+static void
+quic_connection_add_cid(quic_info_data_t *conn, quic_cid_t *new_cid, bool from_server) {
+    // 将新的 CID 添加到指定连接的 CID 列表中
+    // 将新的 CID 插入到全局连接映射中
+}
+
+static void
+quic_connection_create_or_update(quic_info_data_t **conn_p, packet_info *pinfo, uint32_t long_packet_type,
+                                 uint32_t version, const quic_cid_t *scid,
+                                 const quic_cid_t *dcid, bool from_server) {
+    // 核心连接管理逻辑，根据报文类型 (Initial, Retry, Handshake) 和方向 (客户端/服务器)
+    // 创建或更新连接信息
+    // 处理 Retry 包时的 ODCID (Original Destination Connection ID) 清理
+}
+
+static void
+quic_connection_destroy(void *data, void *user_data _U_) {
+    // 释放连接相关的密码学句柄和内存
+}
+/* QUIC Connection tracking. }}} */
+        </pre>
+
+        <h3>2.2. 报文解密 (Packet Decryption)</h3>
+        <p>QUIC 报文（除了 Version Negotiation 和部分 Initial 头部）都是加密的。解密需要 TLS 1.3 密钥日志文件（例如 NSS Key Log Format）提供的流量密钥。解析器根据报文类型（Initial、0-RTT、Handshake、1-RTT）和密钥阶段（Key Phase 0/1）选择合适的密钥和算法进行解密。</p>
+        <p><strong>关键数据结构：</strong></p>
+        <ul>
+            <li><code>quic_hp_cipher</code>: Header Protection 密码学句柄。</li>
+            <li><code>quic_pp_cipher</code>: Packet Protection 密码学句柄。</li>
+            <li><code>quic_ciphers</code>: 封装 HP 和 PP 密码学句柄。</li>
+            <li><code>quic_pp_state_t</code>: 存储每个端点的 Packet Protection 状态，包括下一跳密钥、密钥阶段和变更包号。</li>
+            <li><code>quic_decrypt_result_t</code>: 存储解密结果（数据和长度）或错误信息。</li>
+        </ul>
+        <p><strong>代码逻辑：</strong></p>
+        <pre>
+/* PROTECTED PAYLOAD DECRYPTION (done in first pass) */
+
+static bool
+quic_decrypt_header(tvbuff_t *tvb, unsigned pn_offset, quic_hp_cipher *hp_cipher, int hp_cipher_algo,
+                    uint8_t *first_byte, uint32_t *pn, bool loss_bits_negotiated) {
+    // 使用Header Protection密钥解密报文的第一个字节和Packet Number
+    // 从报文中提取样本 (Sample)
+    // 根据协商的HP算法 (AES-ECB/CHACHA20) 生成掩码 (mask)
+    // 将第一个字节和Packet Number与掩码进行XOR操作
+}
+
+static void
+quic_decrypt_message(quic_pp_cipher *pp_cipher, tvbuff_t *head, unsigned header_length,
+                     uint8_t first_byte, unsigned pkn_len, uint64_t packet_number, quic_decrypt_result_t *result, packet_info *pinfo) {
+    // 使用Packet Protection密钥解密报文负载
+    // 构建认证加密的Additional Authenticated Data (AAD) - 即QUIC头部
+    // 构建Nonce (基于IV和Packet Number)
+    // 使用GCM/ChaCha20-Poly1305等AEAD算法解密负载并验证认证标签 (Authentication Tag)
+}
+
+static bool
+quic_derive_initial_secrets(const quic_cid_t *cid,
+                            uint8_t client_initial_secret[HASH_SHA2_256_LENGTH],
+                            uint8_t server_initial_secret[HASH_SHA2_256_LENGTH],
+                            uint32_t version, const char **error) {
+    // 根据初始 Connection ID 和版本号，使用 HKDF-Extract 和 HKDF-Expand-Label 派生客户端和服务器的 Initial Secrets
+    // 使用不同的盐值 (salt) 和标签 (label) 用于不同版本 (draft-22, draft-23, draft-29, v1, v2)
+}
+
+static bool
+quic_create_initial_decoders(const quic_cid_t *cid, const char **error, quic_info_data_t *quic_info) {
+    // 为 Initial 报文创建解密器
+    // 调用 quic_derive_initial_secrets 获取初始密钥
+    // 调用 quic_ciphers_prepare 初始化 HP 和 PP 密码学句柄
+}
+
+static bool
+quic_create_decoders(packet_info *pinfo, quic_info_data_t *quic_info, quic_ciphers *ciphers,
+                     bool from_server, TLSRecordType type, const char **error) {
+    // 为 Handshake 和 1-RTT 报文创建解密器
+    // 从 TLS 接口获取密码套件信息 (算法、模式、哈希)
+    // 从 TLS 接口获取对应的流量密钥 (TLS_SECRET_HANDSHAKE / TLS_SECRET_APP)
+    // 调用 quic_ciphers_prepare 初始化 HP 和 PP 密码学句柄
+}
+
+static quic_hp_cipher *
+quic_get_1rtt_hp_cipher(packet_info *pinfo, quic_info_data_t *quic_info, bool from_server, const char **error) {
+    // 首次收到 Short Header 报文时，尝试从 TLS 接口获取 1-RTT 密钥并初始化 HP 和 PP 密码学句柄
+    // 也会在这里查找 ALPN 并设置应用层协议解析器 (quic_info->app_handle)
+}
+
+static bool
+quic_get_pp_cipher(quic_pp_cipher *pp_cipher, bool key_phase, quic_info_data_t *quic_info, bool from_server, uint64_t pkn) {
+    // 根据报文的 Key Phase Bit 和 Packet Number，选择或创建 Packet Protection 密码学句柄
+    // 处理密钥更新 (Key Update) 机制
+}
+
+static void
+quic_set_pp_cipher(quic_pp_cipher *pp_cipher, bool key_phase, quic_info_data_t *quic_info, bool from_server, uint64_t pkn) {
+    // 在成功解密后，更新当前密钥阶段的 Packet Protection 密码学句柄，并轮换下一跳密钥
+}
+        </pre>
+
+        <h3>2.3. 流重组 (Stream Reassembly)</h3>
+        <p>QUIC 的 STREAM 帧可以承载应用层数据，这些数据可能被分割成多个帧、乱序到达或重传。解析器需要将这些分散的 STREAM 帧重新组合成完整的应用层数据流，以便上层协议（如 HTTP/3）进行解析。</p>
+        <p><strong>关键数据结构：</strong></p>
+        <ul>
+            <li><code>quic_stream_state</code>: 存储每个 QUIC 流的状态，包括流 ID、多段 PDU 列表 (用于重组)、子解析器私有数据。</li>
+            <li><code>reassembly_table quic_reassembly_table</code>: Wireshark 的通用重组表，用于管理 STREAM 帧的片段。</li>
+            <li><code>quic_stream_key</code>: 用于重组表的键，包含流 ID、帧 ID、连接号和方向。</li>
+        </ul>
+        <p><strong>代码逻辑：</strong></p>
+        <pre>
+/* QUIC Streams tracking and reassembly. {{{ */
+static reassembly_table quic_reassembly_table;
+
+static unsigned quic_stream_hash(const void *k) { ... } // 流键哈希函数
+static int quic_stream_equal(const void *k1, const void *k2) { ... } // 流键相等比较函数
+
+static void *quic_stream_persistent_key(const packet_info *pinfo _U_, const uint32_t id, const void *data) { ... } // 创建持久化流键
+static void quic_stream_free_persistent_key(void *ptr) { ... } // 释放流键
+
+static quic_stream_state *
+quic_get_stream_state(packet_info *pinfo, quic_info_data_t *quic_info, bool from_server, uint64_t stream_id) {
+    // 获取或创建指定流的 quic_stream_state 结构
+    // 维护一个 wmem_map_t 从 stream_id 映射到 stream_state
+}
+
+static void
+process_quic_stream(tvbuff_t *tvb, int offset, packet_info *pinfo, proto_tree *tree,
+                    quic_info_data_t *quic_info, quic_stream_info *stream_info,
+                    const quic_packet_info_t *quic_packet) {
+    // 如果存在应用层解析器 (app_handle 或 zrtt_app_handle)，则调用其解析重组后的流数据
+}
+
+static void
+desegment_quic_stream(tvbuff_t *tvb, int offset, int length, packet_info *pinfo,
+                      proto_tree *tree, quic_info_data_t *quic_info,
+                      quic_stream_info *stream_info,
+                      quic_stream_state *stream,
+                      const quic_packet_info_t *quic_packet) {
+    // 核心流重组逻辑
+    // 使用 Wireshark 的 `fragment_add` 和 `fragment_get` 函数将 STREAM 帧片段添加到 `quic_reassembly_table`
+    // 处理乱序、重传和重叠片段
+    // 当一个完整的 PDU (Protocol Data Unit) 重组完成后，调用 `process_quic_stream` 将数据传递给上层解析器
+}
+
+static void
+dissect_quic_stream_payload(tvbuff_t *tvb, int offset, int length, packet_info *pinfo,
+                            proto_tree *tree, quic_info_data_t *quic_info,
+                            quic_stream_info *stream_info,
+                            quic_stream_state *stream,
+                            const quic_packet_info_t *quic_packet) {
+    // 封装调用 `desegment_quic_stream` 进行流数据重组
+}
+/* QUIC Streams tracking and reassembly. }}} */
+        </pre>
+
+        <h3>2.4. CRYPTO 流重组 (CRYPTO Stream Reassembly)</h3>
+        <p>CRYPTO 帧承载 TLS 握手消息，这些消息也可能分片或乱序。虽然 TLS 协议本身有其内部的重组机制，但 QUIC 解析器在将其传递给 TLS 解析器之前，会先处理 CRYPTO 帧的乱序和重传。</p>
+        <p><strong>关键数据结构：</strong></p>
+        <ul>
+            <li><code>quic_crypto_state</code>: 存储每个加密级别 (Initial, Handshake, 0-RTT) 的 CRYPTO 流状态，包括最大连续偏移量、多段 PDU 列表和重传偏移量映射。</li>
+            <li><code>reassembly_table quic_crypto_reassembly_table</code>: 用于 CRYPTO 帧的重组表。</li>
+            <li><code>quic_crypto_retrans_key</code>: 用于重传检测的键，包含包号、偏移和帧号。</li>
+        </ul>
+        <p><strong>代码逻辑：</strong></p>
+        <pre>
+static bool quic_crypto_out_of_order = true; // 用户偏好设置，是否重组乱序CRYPTO帧
+
+static reassembly_table quic_crypto_reassembly_table;
+
+static unsigned quic_crypto_retrans_hash(const void *k) { ... } // 重传键哈希函数
+static int quic_crypto_retrans_equal(const void *k1, const void *k2) { ... } // 重传键相等比较函数
+
+static quic_crypto_state *
+quic_get_crypto_state(packet_info *pinfo, quic_info_data_t *quic_info, bool from_server, const uint8_t encryption_level) {
+    // 获取或创建指定加密级别 (Initial, Handshake, 0-RTT) 的 quic_crypto_state 结构
+}
+
+static void
+process_quic_crypto(tvbuff_t *tvb, int offset, int length, packet_info *pinfo,
+                    proto_tree *tree, quic_crypto_info *crypto_info) {
+    // 调用 `tls13_handshake_handle` (TLS 1.3 握手解析器) 来解析 CRYPTO 数据
+}
+
+static void
+desegment_quic_crypto(tvbuff_t *tvb, int offset, int length, packet_info *pinfo,
+                      proto_tree *tree, quic_info_data_t *quic_info _U_,
+                      quic_crypto_info *crypto_info,
+                      quic_crypto_state *crypto) {
+    // 核心 CRYPTO 流重组逻辑，但主要关注乱序和重传处理
+    // 检查是否有重传或重叠数据，并进行相应的标记或调整偏移量
+    // 使用 `fragment_add` 将片段添加到 `quic_crypto_reassembly_table`
+    // 当片段补齐了连续部分时，调用 `process_quic_crypto` 传递给 TLS 解析器
+    // 注意：TLS 握手解析器会处理其自身的碎片化，这里主要处理 QUIC 层的乱序
+}
+
+static void
+dissect_quic_crypto_payload(tvbuff_t *tvb, int offset, int length, packet_info *pinfo,
+                            proto_tree *tree, quic_info_data_t *quic_info,
+                            quic_crypto_info *crypto_info,
+                            quic_crypto_state *crypto) {
+    // 封装调用 `desegment_quic_crypto` 进行 CRYPTO 数据重组 (如果启用了乱序重组)
+}
+        </pre>
+
+        <h3>2.5. 多路径支持 (Multipath Support)</h3>
+        <p>Wireshark 的 QUIC 解析器支持 QUIC 多路径扩展，允许在同一连接上使用多个路径（例如，同时使用 Wi-Fi 和蜂窝网络）。这涉及到跟踪每个路径的 Packet Number 空间和 Connection ID。</p>
+        <p><strong>关键数据结构：</strong></p>
+        <ul>
+            <li><code>quic_info_data_t</code> 中的 <code>client_multipath</code> 和 <code>server_multipath</code> 字段（表示多路径版本）。</li>
+            <li><code>quic_info_data_t</code> 中的 <code>max_client_mp_pkn</code> 和 <code>max_server_mp_pkn</code>（通过路径 ID 映射的 Packet Number 空间）。</li>
+        </ul>
+        <p><strong>代码逻辑：</strong></p>
+        <pre>
+/* multipath*/
+static int hf_quic_mp_nci_path_identifier;
+static int hf_quic_mp_rc_path_identifier;
+static int hf_quic_mp_ack_path_identifier;
+static int hf_quic_mp_pa_path_identifier;
+static int hf_quic_mp_ps_path_identifier;
+static int hf_quic_mp_ps_path_status_sequence_number;
+static int hf_quic_mp_ps_path_status;
+static int hf_quic_mp_maximum_paths;
+static int hf_quic_mp_maximum_path_identifier;
+
+static unsigned
+quic_multipath_negotiated(quic_info_data_t *conn) {
+    // 检查客户端和服务器是否都协商了多路径能力
+}
+
+void
+quic_add_multipath(packet_info *pinfo, unsigned version) {
+    // 从传输参数 (Transport Parameters) 中记录多路径协商版本
+}
+
+static uint64_t *
+quic_max_packet_number(quic_info_data_t *quic_info, uint64_t path_id, bool from_server, uint8_t first_byte) {
+    // 如果协商了多路径且 path_id > 0，则根据 path_id 查找或创建独立的 Packet Number 空间
+    // 否则，使用常规的 Initial/Handshake/Appdata Packet Number 空间
+}
+
+// 在 dissect_quic_frame_type 函数中，对以下多路径帧进行解析：
+// FT_MP_ACK, FT_MP_ACK_ECN, FT_PATH_ABANDON, FT_PATH_STATUS, FT_PATH_STANDBY, FT_PATH_AVAILABLE,
+// FT_MP_NEW_CONNECTION_ID, FT_MP_RETIRE_CONNECTION_ID, FT_MAX_PATHS, FT_MAX_PATH_ID
+// 这些帧包含 `Path Identifier` 字段，用于区分不同路径的 ACK、状态更新或 Connection ID 管理
+        </pre>
+
+        <h3>2.6. 连接迁移和无状态重置 (Connection Migration & Stateless Reset)</h3>
+        <p>QUIC 支持连接迁移，允许客户端更改其 IP 地址和/或端口。解析器通过 Connection ID 而非网络五元组来跟踪连接，从而支持这一特性。无状态重置是当端点无法识别接收到的 Connection ID 时，发送一个无状态重置包来终止连接，Wireshark 会尝试通过匹配无状态重置令牌来识别此类报文。</p>
+        <p><strong>代码逻辑：</strong></p>
+        <pre>
+static quic_info_data_t *
+quic_find_stateless_reset_token(packet_info *pinfo, tvbuff_t *tvb, bool *from_server) {
+    // 遍历当前五元组上的所有已知 QUIC 连接，检查报文末尾的 16 字节是否匹配任何连接的无状态重置令牌 (Stateless Reset Token)
+    // RFC 9000 10.3.1 规定，即使是 Long Header 格式的报文，如果其末尾匹配无状态重置令牌，也应被识别为无状态重置
+}
+
+void
+quic_add_stateless_reset_token(packet_info *pinfo, tvbuff_t *tvb, int offset, const quic_cid_t *cid) {
+    // 当 NEW_CONNECTION_ID 帧被解析时，从中提取无状态重置令牌并存储到对应的 Connection ID 中
+}
+
+static int
+dissect_quic_stateless_reset(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *quic_tree, const quic_datagram *dgram_info _U_) {
+    // 解析识别为无状态重置的报文，突出显示其“不可预测位”和“无状态重置令牌”
+    // 检查报文是否符合 Short Header 格式 (RFC 9000 要求)，如果不符合则添加协议违规专家信息
+}
+        </pre>
+
+        <h3>2.7. 跟踪 QUIC 流 (Follow QUIC Stream)</h3>
+        <p>Wireshark 的 "Follow Stream" 功能允许用户查看特定应用层流的完整数据。QUIC 解析器扩展了这一功能，使其适用于 QUIC 内部的逻辑流（Stream ID）。</p>
+        <p><strong>代码逻辑：</strong></p>
+        <pre>
+static int quic_follow_tap; // Tap listener ID
+
+static void
+quic_streams_add(packet_info *pinfo, quic_info_data_t *quic_info, uint64_t stream_id) {
+    // 在解析 STREAM 帧时，将流 ID 添加到连接的 `streams_list` (有序列表) 和 `streams_map` (按帧号映射到第一个流 ID)
+    // 用于 "Follow QUIC Stream" 功能中的流查找和过滤
+}
+
+static quic_info_data_t *
+get_conn_by_number(unsigned conn_number) {
+    // 根据连接号查找 QUIC 连接
+}
+
+bool
+quic_get_stream_id_le(unsigned conn_number, unsigned sub_stream_id, unsigned *sub_stream_id_out) {
+    // 在指定连接中查找小于或等于给定子流 ID 的最大流 ID (用于“下一个/上一个流”导航)
+}
+
+bool
+quic_get_stream_id_ge(unsigned conn_number, unsigned sub_stream_id, unsigned *sub_stream_id_out) {
+    // 在指定连接中查找大于或等于给定子流 ID 的最小流 ID
+}
+
+static char *
+quic_follow_conv_filter(epan_dissect_t *edt _U_, packet_info *pinfo, unsigned *stream, unsigned *sub_stream) {
+    // 为“Follow QUIC Stream”功能生成显示过滤器字符串 (quic.connection.number eq X and quic.stream.stream_id eq Y)
+    // 根据当前报文所属的连接号和流 ID
+}
+
+static char *
+quic_follow_index_filter(unsigned stream, unsigned sub_stream) {
+    // 仅根据连接号和流 ID 生成显示过滤器字符串
+}
+
+static tap_packet_status
+follow_quic_tap_listener(void *tapdata, packet_info *pinfo, epan_dissect_t *edt _U_, const void *data, tap_flags_t flags _U_) {
+    // 当“Follow QUIC Stream”功能激活时，此监听器会收集指定流的原始数据
+    // 将流数据复制到 `follow_record_t` 并添加到 `follow_info_t` 的 `payload` 列表中
+    // 记录报文号、时间戳、服务器/客户端方向和字节数
+}
+        </pre>
+    </div>
+</body>
+</html>

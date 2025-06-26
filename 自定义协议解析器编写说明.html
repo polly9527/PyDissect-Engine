@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>自定义协议解析器编写说明</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+            line-height: 1.6;
+            background-color: #f8f9fa;
+            color: #212529;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            background-color: #ffffff;
+            border-radius: 8px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.05);
+            padding: 40px;
+        }
+        h1, h2, h3 {
+            color: #0056b3;
+            border-bottom: 2px solid #e9ecef;
+            padding-bottom: 10px;
+            margin-top: 30px;
+        }
+        h1 {
+            font-size: 2.2em;
+            text-align: center;
+            border-bottom: none;
+        }
+        h2 {
+            font-size: 1.8em;
+        }
+        h3 {
+            font-size: 1.4em;
+            border-bottom-style: dashed;
+        }
+        p, ul {
+            margin-bottom: 1.2em;
+        }
+        ul {
+            padding-left: 20px;
+        }
+        li {
+            margin-bottom: 0.5em;
+        }
+        code {
+            font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace;
+            background-color: #e9ecef;
+            color: #c7254e;
+            padding: 2px 5px;
+            border-radius: 4px;
+            font-size: 0.9em;
+        }
+        pre {
+            background-color: #282c34;
+            color: #abb2bf;
+            padding: 20px;
+            border-radius: 8px;
+            overflow-x: auto;
+            font-size: 0.9em;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        pre code {
+            background-color: transparent;
+            color: inherit;
+            padding: 0;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        }
+        th, td {
+            border: 1px solid #dee2e6;
+            padding: 12px;
+            text-align: left;
+        }
+        th {
+            background-color: #007bff;
+            color: white;
+            font-weight: bold;
+        }
+        tbody tr:nth-child(even) {
+            background-color: #f8f9fa;
+        }
+        strong {
+            color: #d9534f;
+        }
+        .note {
+            background-color: #e7f3ff;
+            border-left: 5px solid #007bff;
+            padding: 15px;
+            margin: 20px 0;
+            border-radius: 4px;
+        }
+        /* Syntax Highlighting */
+        .code-comment { color: #5c6370; font-style: italic; }
+        .code-keyword { color: #c678dd; }
+        .code-function { color: #61afef; }
+        .code-string { color: #98c379; }
+        .code-number { color: #d19a66; }
+        .code-class { color: #e5c07b; }
+        .code-operator { color: #56b6c2; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>自定义协议解析器编写说明</h1>
+        <p>本文档将指导您如何为 <code>traffic_detector_v2.py</code> 流量分析框架编写一个功能完整、符合规范的自定义协议解析器。请遵循以下步骤和规范，以确保您的解析器能被主程序正确加载和调用。</p>
+        <div class="note">
+            <p><strong>核心思想是 “注册-识别-解析” 三步流程：</strong></p>
+            <ol>
+                <li><strong>注册 (Register)</strong>：通过一个 <code>register()</code> 函数，向主程序声明解析器的基本信息、识别函数和订阅条件。</li>
+                <li><strong>识别 (Identify)</strong>：提供一个轻量级的识别函数，快速判断一个数据包是否属于目标协议。</li>
+                <li><strong>解析 (Parse)</strong>：提供一个详细的解析函数，对已识别的协议数据包进行深度分析，并返回结构化的结果。</li>
+            </ol>
+        </div>
+
+        <h2>一、 文件和目录结构</h2>
+        <ul>
+            <li><strong>存放位置</strong>：所有自定义解析器模块（<code>.py</code> 文件） <strong>必须</strong> 存放于与主程序 <code>traffic_detector_v2.py</code> 同级的 <code>detectors</code> 文件夹内。</li>
+            <li><strong>文件命名</strong>：文件名应清晰明了，例如 <code>my_protocol_detector.py</code>。避免使用 <code>__init__.py</code> 或其他以下划线开头的名称。</li>
+        </ul>
+
+        <h2>二、 核心：<code>register()</code> 注册函数</h2>
+        <p>每个解析器模块 <strong>必须</strong> 包含一个名为 <code>register()</code> 的函数。此函数是主程序与解析器交互的唯一入口点。它不需要任何参数，且 <strong>必须返回一个字典</strong>。</p>
+        <p>该字典定义了解析器的所有行为。以下是字典中必须或建议包含的键：</p>
+        
+        <table>
+            <thead>
+                <tr>
+                    <th>键 (Key)</th>
+                    <th>类型</th>
+                    <th>是否必须</th>
+                    <th>描述</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><code>name</code></td>
+                    <td><code>str</code></td>
+                    <td><strong>是</strong></td>
+                    <td>解析器的唯一名称，例如 "TLS" 或 "HTTP"。该名称将用于日志文件名和统计输出。</td>
+                </tr>
+                <tr>
+                    <td><code>function</code></td>
+                    <td><code>Callable[[bytes, int, int], bool]</code></td>
+                    <td><strong>是</strong></td>
+                    <td>指向 <strong>协议识别函数</strong>。主程序通过此函数快速判断数据包是否为目标协议。</td>
+                </tr>
+                <tr>
+                    <td><code>parser_function</code></td>
+                    <td><code>Callable[[bytes], Optional[Dict]]</code></td>
+                    <td><strong>否</strong></td>
+                    <td>指向 <strong>协议解析函数</strong>。当识别函数返回 <code>True</code> 后，主程序调用此函数进行深度解析。如果缺少此键，则只会进行识别和计数，不会解析和记录详细内容。</td>
+                </tr>
+                <tr>
+                    <td><code>subscriptions</code></td>
+                    <td><code>Dict[str, List[Dict]]</code></td>
+                    <td><strong>否</strong></td>
+                    <td>定义解析器感兴趣的流量类型。这是高效分发数据包的关键。<strong>强烈建议提供此项</strong>。</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <h3><code>subscriptions</code> 详细说明</h3>
+        <p><code>subscriptions</code> 字典用于实现基于端口的快速分发，避免对每个数据包都运行识别函数，从而大大提升性能。其结构如下：</p>
+        <pre><code class="language-python">
+{
+    <span class="code-string">"port_based"</span>: [
+        {<span class="code-string">"protocol"</span>: <span class="code-string">"TCP"</span>, <span class="code-string">"port"</span>: <span class="code-number">443</span>},
+        {<span class="code-string">"protocol"</span>: <span class="code-string">"UDP"</span>, <span class="code-string">"port"</span>: <span class="code-number">5353</span>}
+    ]
+}
+        </code></pre>
+        <ul>
+            <li><code>"port_based"</code>: 目前支持的唯一订阅类型。</li>
+            <li><code>"protocol"</code>: 传输层协议，目前支持 <code>"TCP"</code> 或 <code>"UDP"</code> (大小写不敏感)。</li>
+            <li><code>"port"</code>: 您希望监听的端口号 (整数)。</li>
+        </ul>
+        <p>当一个 TCP/443 的数据包到达时，主程序 <code>DetectorDispatcher</code> 会自动将其负载 (payload) 交给订阅了该端口的解析器的 <strong>识别函数</strong> (<code>function</code>) 进行判断。</p>
+
+        <h2>三、 编写协议识别函数</h2>
+        <p>此函数对应 <code>register()</code> 返回字典中的 <code>function</code> 键。它的作用是 <strong>快速、高效地</strong> 确认数据包载荷是否符合您协议的基本特征。</p>
+        <ul>
+            <li><strong>函数签名</strong>： 必须为 <code>(payload: bytes, sport: int, dport: int) -> bool</code>
+                <ul>
+                    <li><code>payload</code> (<code>bytes</code>): L4 协议（TCP/UDP）的数据部分。</li>
+                    <li><code>sport</code> (<code>int</code>): 源端口。</li>
+                    <li><code>dport</code> (<code>int</code>): 目的端口。</li>
+                </ul>
+            </li>
+            <li><strong>返回值</strong>：
+                <ul>
+                    <li><code>True</code>: 如果 <code>payload</code> 确认为目标协议。</li>
+                    <li><code>False</code>: 如果不是目标协议。</li>
+                </ul>
+            </li>
+            <li><strong>设计要点</strong>：
+                <ul>
+                    <li><strong>性能优先</strong>：此函数会被频繁调用。应避免复杂的计算和正则表达式。最好只检查协议的魔术数字 (Magic Number)、固定的头部字段、类型或版本号等。</li>
+                    <li><strong>健壮性</strong>：务必进行充分的长度检查，防止 <code>IndexError</code>。使用 <code>try...except</code> 块来捕获 <code>struct.error</code> 等解析异常，并在异常时返回 <code>False</code>。</li>
+                </ul>
+            </li>
+        </ul>
+        <p><strong>示例 (参考 <code>tls_detector.py</code>)</strong>:</p>
+        <pre><code class="language-python">
+<span class="code-keyword">import</span> struct
+
+<span class="code-keyword">def</span> <span class="code-function">is_tls_packet</span>(payload: <span class="code-class">bytes</span>, sport: <span class="code-class">int</span>, dport: <span class="code-class">int</span>) -> <span class="code-class">bool</span>:
+    <span class="code-comment"># 1. 长度检查</span>
+    <span class="code-keyword">if</span> len(payload) <span class="code-operator"><</span> <span class="code-number">5</span>:
+        <span class="code-keyword">return</span> <span class="code-keyword">False</span>
+    
+    <span class="code-comment"># 2. 检查 Content Type 字段 (TLS 记录层的第一个字节)</span>
+    content_type <span class="code-operator">=</span> payload[<span class="code-number">0</span>]
+    <span class="code-keyword">if</span> content_type <span class="code-keyword">not</span> <span class="code-keyword">in</span> {<span class="code-number">20</span>, <span class="code-number">21</span>, <span class="code-number">22</span>, <span class="code-number">23</span>, <span class="code-number">24</span>}: <span class="code-comment"># Change Cipher Spec, Alert, Handshake, etc.</span>
+        <span class="code-keyword">return</span> <span class="code-keyword">False</span>
+        
+    <span class="code-comment"># 3. 检查版本号 (第2-3字节)</span>
+    <span class="code-keyword">try</span>:
+        version <span class="code-operator">=</span> struct.unpack(<span class="code-string">'!H'</span>, payload[<span class="code-number">1</span>:<span class="code-number">3</span>])[<span class="code-number">0</span>]
+        <span class="code-keyword">if</span> <span class="code-keyword">not</span> (<span class="code-number">0x0300</span> <span class="code-operator"><=</span> version <span class="code-operator"><=</span> <span class="code-number">0x0304</span>): <span class="code-comment"># SSLv3 to TLS 1.3</span>
+            <span class="code-keyword">return</span> <span class="code-keyword">False</span>
+    <span class="code-keyword">except</span> <span class="code-class">struct.error</span>:
+        <span class="code-keyword">return</span> <span class="code-keyword">False</span>
+
+    <span class="code-comment"># 4. 检查记录层长度是否合理</span>
+    record_len <span class="code-operator">=</span> struct.unpack(<span class="code-string">'!H'</span>, payload[<span class="code-number">3</span>:<span class="code-number">5</span>])[<span class="code-number">0</span>]
+    <span class="code-keyword">if</span> len(payload) <span class="code-operator"><</span> <span class="code-number">5</span> <span class="code-operator">+</span> record_len:
+        <span class="code-keyword">return</span> <span class="code-keyword">False</span>
+        
+    <span class="code-keyword">return</span> <span class="code-keyword">True</span>
+        </code></pre>
+
+        <h2>四、 编写协议解析函数</h2>
+        <p>此函数对应 <code>register()</code> 返回字典中的 <code>parser_function</code> 键。它的作用是在协议被识别后，对数据包进行详细的、深度的解析。</p>
+        <ul>
+            <li><strong>函数签名</strong>： 必须为 <code>(payload: bytes) -> Optional[Dict[str, Any]]</code>
+                <ul>
+                    <li><code>payload</code> (<code>bytes</code>): 与识别函数收到的 <code>payload</code> 完全相同。</li>
+                </ul>
+            </li>
+            <li><strong>返回值</strong>：
+                <ul>
+                    <li>一个 <strong>可以被 <code>json.dumps()</code> 序列化的字典</strong>，其中包含您提取的协议信息。</li>
+                    <li><code>None</code>: 如果在深度解析过程中发现该数据包虽然通过了初步识别，但实际上并非有效或完整的协议包。</li>
+                </ul>
+            </li>
+            <li><strong>设计要点</strong>：
+                <ul>
+                    <li><strong>结构化输出</strong>：返回的字典应有清晰的结构，便于阅读日志。可以嵌套字典和列表。</li>
+                    <li><strong>可读性优先</strong>：将原始的十六进制代码或整数值映射为人类可读的字符串（如 <code>tls_detector.py</code> 中将 <code>0x0303</code> 映射为 <code>"TLS 1.2"</code>）。这极大地提升了日志的价值。</li>
+                    <li><strong>代码组织</strong>：对于复杂的协议，建议将不同的解析逻辑拆分成独立的辅助函数（如 <code>tls_detector.py</code> 中的 <code>_parse_sni</code>, <code>_parse_extensions</code> 等），使主解析函数更清晰。</li>
+                    <li><strong>错误处理</strong>：同样需要健壮的错误处理。如果解析失败，应返回 <code>None</code> 或在字典中包含一个 <code>'error'</code> 键来描述问题。</li>
+                </ul>
+            </li>
+        </ul>
+        <p><strong>示例 (一个简化的 HTTP 请求解析器)</strong>:</p>
+        <pre><code class="language-python">
+<span class="code-keyword">from</span> typing <span class="code-keyword">import</span> <span class="code-class">Optional</span>, <span class="code-class">Dict</span>, <span class="code-class">Any</span>
+
+<span class="code-keyword">def</span> <span class="code-function">parse_http_request</span>(payload: <span class="code-class">bytes</span>) -> <span class="code-class">Optional</span>[<span class="code-class">Dict</span>[<span class="code-class">str</span>, <span class="code-class">Any</span>]]:
+    <span class="code-keyword">try</span>:
+        decoded_payload <span class="code-operator">=</span> payload.decode(<span class="code-string">'utf-8'</span>, <span class="code-string">'ignore'</span>)
+        lines <span class="code-operator">=</span> decoded_payload.split(<span class="code-string">'\r\n'</span>)
+        
+        <span class="code-keyword">if</span> <span class="code-keyword">not</span> lines <span class="code-keyword">or</span> len(lines) <span class="code-operator"><</span> <span class="code-number">1</span>:
+            <span class="code-keyword">return</span> <span class="code-keyword">None</span> <span class="code-comment"># 不是有效的HTTP请求</span>
+            
+        request_line <span class="code-operator">=</span> lines[<span class="code-number">0</span>]
+        parts <span class="code-operator">=</span> request_line.split()
+        <span class="code-keyword">if</span> len(parts) <span class="code-operator">!=</span> <span class="code-number">3</span>:
+            <span class="code-keyword">return</span> <span class="code-keyword">None</span> <span class="code-comment"># 请求行格式不正确</span>
+
+        method, path, http_version <span class="code-operator">=</span> parts
+        
+        headers <span class="code-operator">=</span> {}
+        <span class="code-keyword">for</span> line <span class="code-keyword">in</span> lines[<span class="code-number">1</span>:]:
+            <span class="code-keyword">if</span> line <span class="code-operator">==</span> <span class="code-string">""</span>: <span class="code-comment"># 遇到空行，表示头部结束</span>
+                <span class="code-keyword">break</span>
+            key, value <span class="code-operator">=</span> line.split(<span class="code-string">":"</span>, <span class="code-number">1</span>)
+            headers[key.strip()] <span class="code-operator">=</span> value.strip()
+            
+        <span class="code-keyword">return</span> {
+            <span class="code-string">"request_line"</span>: {
+                <span class="code-string">"method"</span>: method,
+                <span class="code-string">"path"</span>: path,
+                <span class="code-string">"version"</span>: http_version
+            },
+            <span class="code-string">"headers"</span>: headers
+        }
+    <span class="code-keyword">except</span> <span class="code-class">Exception</span>:
+        <span class="code-comment"># 在解码或分割过程中发生任何错误，都认为解析失败</span>
+        <span class="code-keyword">return</span> <span class="code-keyword">None</span>
+        </code></pre>
+        
+        <h2>五、 完整解析器模板</h2>
+        <p>将以上所有部分组合在一起，形成一个完整的解析器文件。</p>
+        <p><strong>文件名: <code>detectors/simple_http_detector.py</code></strong></p>
+        <pre><code class="language-python">
+<span class="code-comment"># detectors/simple_http_detector.py</span>
+
+<span class="code-keyword">from</span> typing <span class="code-keyword">import</span> <span class="code-class">Dict</span>, <span class="code-class">Any</span>, <span class="code-class">List</span>, <span class="code-class">Optional</span>, <span class="code-class">Callable</span>
+
+<span class="code-comment"># --- 1. 协议识别函数 ---</span>
+<span class="code-keyword">def</span> <span class="code-function">is_http_request</span>(payload: <span class="code-class">bytes</span>, sport: <span class="code-class">int</span>, dport: <span class="code-class">int</span>) -> <span class="code-class">bool</span>:
+    <span class="code-string">"""
+    快速识别是否为 HTTP 请求。
+    这里用一个简单的启发式方法：以常见的 HTTP 方法开头。
+    """</span>
+    <span class="code-keyword">if</span> len(payload) <span class="code-operator"><</span> <span class="code-number">16</span>: <span class="code-comment"># "GET / HTTP/1.1\r\n" 至少需要这么多</span>
+        <span class="code-keyword">return</span> <span class="code-keyword">False</span>
+    
+    <span class="code-comment"># 转换为大写进行比较，只检查前几个字节以提高性能</span>
+    upper_payload_start <span class="code-operator">=</span> payload[:<span class="code-number">8</span>].upper()
+    
+    <span class="code-comment"># 检查是否以常见方法开头</span>
+    http_methods <span class="code-operator">=</span> [<span class="code-string">b"GET "</span>, <span class="code-string">b"POST "</span>, <span class="code-string">b"PUT "</span>, <span class="code-string">b"DELETE "</span>, <span class="code-string">b"HEAD "</span>, <span class="code-string">b"OPTIONS "</span>]
+    <span class="code-keyword">for</span> method <span class="code-keyword">in</span> http_methods:
+        <span class="code-keyword">if</span> upper_payload_start.startswith(method):
+            <span class="code-keyword">return</span> <span class="code-keyword">True</span>
+            
+    <span class="code-keyword">return</span> <span class="code-keyword">False</span>
+
+<span class="code-comment"># --- 2. 协议解析函数 ---</span>
+<span class="code-keyword">def</span> <span class="code-function">parse_http_request</span>(payload: <span class="code-class">bytes</span>) -> <span class="code-class">Optional</span>[<span class="code-class">Dict</span>[<span class="code-class">str</span>, <span class="code-class">Any</span>]]:
+    <span class="code-string">"""
+    解析 HTTP 请求的头部信息。
+    """</span>
+    <span class="code-keyword">try</span>:
+        decoded_payload <span class="code-operator">=</span> payload.decode(<span class="code-string">'utf-8'</span>, <span class="code-string">'ignore'</span>)
+        lines <span class="code-operator">=</span> decoded_payload.split(<span class="code-string">'\r\n'</span>)
+        
+        <span class="code-keyword">if</span> <span class="code-keyword">not</span> lines <span class="code-keyword">or</span> len(lines) <span class="code-operator"><</span> <span class="code-number">1</span>:
+            <span class="code-keyword">return</span> <span class="code-keyword">None</span>
+            
+        request_line <span class="code-operator">=</span> lines[<span class="code-number">0</span>]
+        parts <span class="code-operator">=</span> request_line.split()
+        <span class="code-keyword">if</span> len(parts) <span class="code-operator">!=</span> <span class="code-number">3</span>:
+            <span class="code-keyword">return</span> <span class="code-keyword">None</span>
+
+        method, path, http_version <span class="code-operator">=</span> parts
+        
+        <span class="code-comment"># 为了演示，只解析 Host 和 User-Agent</span>
+        host <span class="code-operator">=</span> <span class="code-string">"N/A"</span>
+        user_agent <span class="code-operator">=</span> <span class="code-string">"N/A"</span>
+        <span class="code-keyword">for</span> line <span class="code-keyword">in</span> lines[<span class="code-number">1</span>:]:
+            <span class="code-keyword">if</span> line.lower().startswith(<span class="code-string">"host:"</span>):
+                host <span class="code-operator">=</span> line.split(<span class="code-string">":"</span>, <span class="code-number">1</span>)[<span class="code-number">1</span>].strip()
+            <span class="code-keyword">elif</span> line.lower().startswith(<span class="code-string">"user-agent:"</span>):
+                user_agent <span class="code-operator">=</span> line.split(<span class="code-string">":"</span>, <span class="code-number">1</span>)[<span class="code-number">1</span>].strip()
+
+        <span class="code-keyword">return</span> {
+            <span class="code-string">"type"</span>: <span class="code-string">"HTTP Request"</span>,
+            <span class="code-string">"method"</span>: method,
+            <span class="code-string">"path"</span>: path,
+            <span class="code-string">"host"</span>: host,
+            <span class="code-string">"user_agent"</span>: user_agent
+        }
+    <span class="code-keyword">except</span> <span class="code-class">Exception</span>:
+        <span class="code-keyword">return</span> <span class="code-keyword">None</span> <span class="code-comment"># 解析失败</span>
+
+<span class="code-comment"># --- 3. 注册函数 (核心) ---</span>
+<span class="code-keyword">def</span> <span class="code-function">register</span>() -> <span class="code-class">Dict</span>[<span class="code-class">str</span>, <span class="code-class">Any</span>]:
+    <span class="code-string">"""
+    向主程序注册 HTTP 解析器。
+    """</span>
+    <span class="code-keyword">return</span> {
+        <span class="code-string">"name"</span>: <span class="code-string">"HTTP"</span>,
+        <span class="code-string">"function"</span>: is_http_request,
+        <span class="code-string">"parser_function"</span>: parse_http_request,
+        <span class="code-string">"subscriptions"</span>: {
+            <span class="code-string">"port_based"</span>: [
+                {<span class="code-string">"protocol"</span>: <span class="code-string">"TCP"</span>, <span class="code-string">"port"</span>: <span class="code-number">80</span>},
+                {<span class="code-string">"protocol"</span>: <span class="code-string">"TCP"</span>, <span class="code-string">"port"</span>: <span class="code-number">8080</span>}
+            ]
+        }
+    }
+        </code></pre>
+        <hr style="margin-top: 40px;">
+        <p style="text-align: center; color: #6c757d;">严格遵循本说明，您就可以轻松地扩展流量分析框架，使其能够识别和解析您所关注的任何基于 TCP/UDP 的应用层协议。</p>
+    </div>
+</body>
+</html>

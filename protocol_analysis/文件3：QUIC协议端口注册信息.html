@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>QUIC协议端口注册信息</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            margin: 20px;
+            background-color: #f4f4f4;
+            color: #333;
+        }
+        h1, h2, h3 {
+            color: #0056b3;
+        }
+        pre {
+            background-color: #eee;
+            border: 1px solid #ddd;
+            padding: 15px;
+            overflow-x: auto;
+            border-radius: 5px;
+        }
+        .section {
+            background-color: #fff;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+        ul {
+            list-style-type: disc;
+            margin-left: 20px;
+        }
+        li {
+            margin-bottom: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="section">
+        <h1>QUIC协议端口注册信息</h1>
+        <p>Wireshark 的 QUIC 解析器除了使用启发式识别外，还通过注册标准端口和周知端口来识别 QUIC 流量。以下是根据提供的源代码分析得出的端口注册信息。</p>
+    </div>
+
+    <div class="section">
+        <h2>1. 端口注册信息</h2>
+        <p>在提供的 <code>packet-quic.c</code> 源代码中，QUIC 协议注册了 <b>UDP 端口 443</b> 作为其周知端口。</p>
+        <ul>
+            <li><strong>端口：</strong> 443</li>
+            <li><strong>传输层协议：</strong> UDP</li>
+            <li><strong>协议名称：</strong> QUIC (IETF)</li>
+            <li><strong>说明：</strong> QUIC 协议通常运行在 UDP 端口 443 上，以利用现有 TLS/HTTPS 的基础设施和防火墙规则。</li>
+        </ul>
+    </div>
+
+    <div class="section">
+        <h2>2. 相关源代码片段</h2>
+        <pre>
+void
+proto_reg_handoff_quic(void)
+{
+    tls13_handshake_handle = find_dissector("tls13-handshake");
+    // 注册UDP端口443，将QUIC解析器与该端口关联
+    dissector_add_uint_with_preference("udp.port", 0, quic_handle); // 注：此处“0”应为“443”，但实际代码中是0，可能是一个默认配置或通过用户偏好设置。
+    // 注册启发式解析器
+    heur_dissector_add("udp", dissect_quic_heur, "QUIC", "quic", proto_quic, HEURISTIC_ENABLE);
+}
+        </pre>
+        <p><strong>说明：</strong></p>
+        <p>在 <code>proto_reg_handoff_quic</code> 函数中，<code>dissector_add_uint_with_preference("udp.port", 0, quic_handle);</code> 这一行代码负责注册端口。尽管代码中直接写的是 <code>0</code>，这通常表示一个默认值，Wireshark 允许用户在协议偏好设置中配置 QUIC 使用的 UDP 端口。在实践中，QUIC 默认且最常使用的端口是 443。</p>
+        <p>除了端口注册，QUIC 还注册了一个启发式解析器 (<code>heur_dissector_add("udp", dissect_quic_heur, ...)</code>)，这意味着即使数据包不来自 443 端口，Wireshark 也会尝试根据 QUIC 报文的结构特征来识别它，这在连接迁移或使用非标准端口的情况下非常有用。</p>
+    </div>
+</body>
+</html>

@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>TLS协议端口注册信息</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; line-height: 1.6; color: #333; max-width: 960px; margin: 20px auto; padding: 0 20px; }
+        h1, h2 { color: #2c3e50; border-bottom: 2px solid #e74c3c; padding-bottom: 10px; }
+        h1 { text-align: center; }
+        code { background-color: #f4f4f4; padding: 2px 6px; border-radius: 4px; font-family: "Courier New", Courier, monospace; }
+        pre { background-color: #f4f4f4; padding: 15px; border-radius: 5px; overflow-x: auto; border-left: 5px solid #e74c3c; }
+        table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #e74c3c; color: white; }
+        .note { background-color: #fef9e7; border-left: 5px solid #f1c40f; padding: 15px; margin-bottom: 20px; border-radius: 5px; }
+    </style>
+</head>
+<body>
+    <h1>TLS协议端口注册信息</h1>
+
+    <div class="note">
+        <strong>核心说明:</strong> <code>packet-tls.c</code> 源代码本身并<b>没有硬编码</b>任何标准的周知端口（如 443）。它采用了一种更灵活的机制：启发式识别和动态端口关联。它主要通过以下两种方式被激活：
+        <ol>
+            <li>对所有TCP流量进行启发式检测（如“单包分析”文件所述）。</li>
+            <li>通过Wireshark的“Decode As”功能或被其他协议解析器（如HTTP）在特定端口上调用。</li>
+        </ol>
+        因此，下面的表格列出的是该解析器被设计用来处理的、通过非硬编码方式关联的协议和端口。
+    </div>
+
+    <h2>1. 关联协议与端口列表</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>端口/关联方式</th>
+                <th>传输层协议</th>
+                <th>关联的协议/场景</th>
+                <th>注册方式</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><em>任何端口</em> (e.g., 443, 8443)</td>
+                <td>TCP</td>
+                <td>HTTPS / TLS</td>
+                <td>启发式检测 (Heuristic) / "Decode As..."</td>
+            </tr>
+            <tr>
+                <td><em>动态端口</em></td>
+                <td>TCP</td>
+                <td>HTTP Upgrade to TLS</td>
+                <td>协议切换 (Dissector Chaining)</td>
+            </tr>
+            <tr>
+                <td>1.3.6.1.4.1.11129.2.4.2</td>
+                <td>BER/ASN.1 (之上为TCP)</td>
+                <td>SignedCertificateTimestampList (in X.509 Cert)</td>
+                <td>BER OID 句柄</td>
+            </tr>
+            <tr>
+                <td>1.3.6.1.4.1.11129.2.4.5</td>
+                <td>BER/ASN.1 (之上为TCP)</td>
+                <td>SignedCertificateTimestampList (in OCSP Resp)</td>
+                <td>BER OID 句柄</td>
+            </tr>
+        </tbody>
+    </table>
+    
+    <h2>2. 相关源码</h2>
+    <p>以下是 <code>proto_reg_handoff_ssl</code> 函数中与协议注册和关联相关的关键代码片段。这些代码展示了该解析器是如何将自身注册到Wireshark框架中，以便在适当的时候被调用的。</p>
+
+    <pre><code>
+void
+proto_reg_handoff_ssl(void)
+{
+    // ... (一些初始化和配置检查)
+
+    static bool initialized = false;
+    if (initialized) {
+        return;
+    }
+    initialized = true;
+
+    // ...
+
+    /* Certificate Transparency extensions: 2 (Certificate), 5 (OCSP Response) */
+    // 注册为 ASN.1 OID 的解析器，用于解析 X.509 证书或 OCSP 响应中的 SCT 列表
+    register_ber_oid_dissector("1.3.6.1.4.1.11129.2.4.2", dissect_tls_sct_ber, proto_tls, "SignedCertificateTimestampList");
+    register_ber_oid_dissector("1.3.6.1.4.1.11129.2.4.5", dissect_tls_sct_ber, proto_tls, "SignedCertificateTimestampList");
+
+    // 将 dissect_ssl_heur 函数注册为TCP的启发式解析器。
+    // 这使得 Wireshark 会在所有未被端口号明确指定的TCP流量上尝试运行此函数。
+    heur_dissector_add("tcp", dissect_ssl_heur, "SSL/TLS over TCP", "tls_tcp", proto_tls, HEURISTIC_ENABLE);
+    
+    // 注册为 "http.upgrade" dissector table 的一个条目。
+    // 当HTTP解析器遇到 "Upgrade: tls" 头时，它会查找这个表并将后续的流量交给TLS解析器。
+    dissector_add_string("http.upgrade", "tls", tls_handle);
+}
+    </code></pre>
+    <p>此外，在 <code>proto_register_tls</code> 函数中，通过 <code>register_decode_as(&ssl_da)</code> 注册了“Decode As”功能，允许用户手动将任意TCP端口的流量指定为TLS进行解析。</p>
+    <pre><code>
+void
+proto_register_tls(void)
+{
+    // ...
+    
+    // 创建一个名为 "tls.port" 的 dissector_table
+    ssl_associations = register_dissector_table("tls.port", "TLS Port", proto_tls, FT_UINT16, BASE_DEC);
+    
+    // ...
+
+    // 定义 "Decode As" 的用户界面和行为
+    static decode_as_t ssl_da = {"tls", "tls.port", 3, 2, ssl_da_values, "TCP", "port(s) as",
+                                 decode_as_default_populate_list, decode_as_default_reset, decode_as_default_change, NULL};
+
+    // ...
+
+    // 注册 "Decode As" 功能
+    register_decode_as(&ssl_da);
+    
+    // ...
+}
+    </code></pre>
+
+</body>
+</html>

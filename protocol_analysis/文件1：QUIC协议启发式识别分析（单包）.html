@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>QUIC协议启发式识别分析（单包）</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            margin: 20px;
+            background-color: #f4f4f4;
+            color: #333;
+        }
+        h1, h2, h3 {
+            color: #0056b3;
+        }
+        pre {
+            background-color: #eee;
+            border: 1px solid #ddd;
+            padding: 15px;
+            overflow-x: auto;
+            border-radius: 5px;
+        }
+        .section {
+            background-color: #fff;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+        .mermaid-diagram {
+            background-color: #f9f9f9;
+            border: 1px dashed #ccc;
+            padding: 15px;
+            margin: 15px 0;
+            overflow-x: auto;
+            border-radius: 5px;
+        }
+        ul {
+            list-style-type: disc;
+            margin-left: 20px;
+        }
+        li {
+            margin-bottom: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="section">
+        <h1>QUIC协议启发式识别分析（单包）</h1>
+        <p>本文件旨在详细分析 Wireshark 中 QUIC 协议的启发式识别机制，重点关注单包识别的逻辑、涉及的关键宏以及整体检测方法。请注意，Mermaid 流程图以文本形式展示。</p>
+    </div>
+
+    <div class="section">
+        <h2>1. Mermaid 格式流程图伪代码</h2>
+        <div class="mermaid-diagram">
+<pre>
+graph TD
+    A[UDP报文到达] --> B{判断是否为QUIC协议?};
+    B --&gt; C{检查数据包总长度 &lt; 13字节?};
+    C -- 是 --> D[不是QUIC，返回];
+    C -- 否 --> E{读取第一个字节 flags};
+    E --&gt; F{检查 flags 的最高位 (0x80) 是否为 0 (Short Header)?};
+    F -- 是 (Short Header) --> G{检查已知连接ID长度 quic_cid_lengths 是否为 0?};
+    G -- 是 --> H[不是QUIC，返回];
+    G -- 否 --> I{提取 DCID (长度 QUIC_MAX_CID_LENGTH, 偏移 1)};
+    I --&gt; J{尝试在已知连接中查找匹配的 DCID};
+    J -- 找到匹配 --> K[是QUIC，调用 dissect_quic 进行解析];
+    J -- 未找到 --> H;
+    F -- 否 (Long Header) --> L{读取版本号 version (4字节, 偏移 1)};
+    L --&gt; M{检查 version 是否为 QUIC_DRAFT_VERSION &gt;= 11?};
+    M -- 否 --> H;
+    M -- 是 --> N{读取 DCID 长度 dcid_len (1字节, 偏移 5)};
+    N --&gt; O{检查 dcid_len &gt; QUIC_MAX_CID_LENGTH?};
+    O -- 是 --> H;
+    O -- 否 --> P{检查当前偏移量 + dcid_len 是否超出报文捕获长度?};
+    P -- 是 --> H;
+    P -- 否 --> Q{读取 SCID 长度 scid_len (1字节, 偏移 5 + 1 + dcid_len)};
+    Q --&gt; R{检查 scid_len &gt; QUIC_MAX_CID_LENGTH?};
+    R -- 是 --> H;
+    R -- 否 --> K;
+
+    subgraph 关键宏和变量
+        direction TB
+        MACRO_QUIC_MAX_CID_LENGTH["QUIC_MAX_CID_LENGTH (20)"]
+        VAR_tvb_captured_length["tvb_captured_length(tvb) (当前数据包捕获长度)"]
+        VAR_flags["flags (第一个字节)"]
+        VAR_version["version (4字节版本号)"]
+        VAR_dcid_len["dcid_len (DCID 长度)"]
+        VAR_scid_len["scid_len (SCID 长度)"]
+        VAR_quic_cid_lengths["quic_cid_lengths (已知CID长度的位图)"]
+    end
+</pre>
+        </div>
+        <p><strong>流程图伪代码说明：</strong></p>
+        <ul>
+            <li><strong>A[UDP报文到达]</strong>：表示Wireshark捕获到UDP报文。</li>
+            <li><strong>B{判断是否为QUIC协议?}</strong>：进入启发式判断函数。</li>
+            <li><strong>C{检查数据包总长度 < 13字节?}</strong>：
+                <ul>
+                    <li>数据长度：小于 13 字节。</li>
+                    <li>验证逻辑：QUIC 协议的最小头部长度（Long Header，包含 Flag、Version、DCIL、SCIL 和至少一个 CID 字节）至少为 1 (Flag) + 4 (Version) + 1 (DCIL) + 1 (SCIL) + 1 (DCID) + 1 (SCID) + 1 (Payload Length) + 1 (Packet Number) ≈ 10 字节。如果加上最小的 CID 长度（1字节），则理论最小长度为10字节，但是根据代码，它检查的是13。这里是指 Long Header 的最小长度，如果不足 13 字节，则不能是 QUIC。</li>
+                </ul>
+            </li>
+            <li><strong>E{读取第一个字节 flags}</strong>：
+                <ul>
+                    <li>数据长度：1 字节。</li>
+                    <li>偏移：0。</li>
+                    <li>特征码：无特定特征码，读取整个字节。</li>
+                </ul>
+            </li>
+            <li><strong>F{检查 flags 的最高位 (0x80) 是否为 0 (Short Header)?}</strong>：
+                <ul>
+                    <li>验证逻辑：如果 flags & 0x80 为 0，表示是 Short Header 格式。</li>
+                </ul>
+            </li>
+            <li><strong>G{检查已知连接ID长度 quic_cid_lengths 是否为 0?}</strong>：
+                <ul>
+                    <li>变量：<code>quic_cid_lengths</code>。</li>
+                    <li>验证逻辑：<code>quic_cid_lengths</code> 是一个位图，用于记录在捕获文件中检测到的所有 QUIC 连接的 CID 长度。如果为 0，说明当前捕获文件中还没有识别出任何 QUIC 连接的 CID 长度，因此启发式函数暂时无法通过 DCID 进行识别。</li>
+                </ul>
+            </li>
+            <li><strong>I{提取 DCID (长度 QUIC_MAX_CID_LENGTH, 偏移 1)}</strong>：
+                <ul>
+                    <li>数据长度：<code>QUIC_MAX_CID_LENGTH</code>（20 字节）。</li>
+                    <li>偏移：1。</li>
+                    <li>验证逻辑：对于 Short Header，DCID 的长度是未知的，因此会尝试读取最多 <code>QUIC_MAX_CID_LENGTH</code> 字节，并在已知连接中查找匹配。</li>
+                </ul>
+            </li>
+            <li><strong>J{尝试在已知连接中查找匹配的 DCID}</strong>：
+                <ul>
+                    <li>验证逻辑：调用 <code>quic_connection_find</code> 函数，该函数会根据提取的 DCID 在已建立的连接中查找匹配。如果找到匹配，则认为是 QUIC。</li>
+                </ul>
+            </li>
+            <li><strong>L{读取版本号 version (4字节, 偏移 1)}</strong>：
+                <ul>
+                    <li>数据长度：4 字节。</li>
+                    <li>偏移：1。</li>
+                    <li>特征码：无特定特征码，读取整个四字节作为版本号。</li>
+                </ul>
+            </li>
+            <li><strong>M{检查 version 是否为 QUIC_DRAFT_VERSION >= 11?}</strong>：
+                <ul>
+                    <li>变量：<code>version</code>。</li>
+                    <li>验证逻辑：调用 <code>quic_draft_version(version)</code> 函数，该函数会根据版本号的特定模式（如 <code>0xff0000xx</code>）判断其是否为 IETF 草案版本，并返回草案号。如果草案号小于 11，则不认为是当前支持的 QUIC 版本。</li>
+                    <li><code>quic_draft_version</code> 函数中识别的常见版本特征码：
+                        <ul>
+                            <li>IETF Draft versions: <code>(version >> 8) == 0xff0000</code></li>
+                            <li>Facebook mvfst (draft-22): <code>0xfaceb001</code></li>
+                            <li>Facebook mvfst (draft-27): <code>0xfaceb002</code>, <code>0xfaceb00e</code></li>
+                            <li>Google Q050: <code>0x51303530</code></li>
+                            <li>Google T050: <code>0x54303530</code></li>
+                            <li>Google T051: <code>0x54303531</code></li>
+                            <li>Version Negotiation forcing (GREASE): <code>(version & 0x0F0F0F0F) == 0x0a0a0a0a</code></li>
+                            <li>QUIC v1: <code>0x00000001</code></li>
+                            <li>QUIC v2: <code>0x6b3343cf</code></li>
+                        </ul>
+                    </li>
+                </ul>
+            </li>
+            <li><strong>N{读取 DCID 长度 dcid_len (1字节, 偏移 5)}</strong>：
+                <ul>
+                    <li>数据长度：1 字节。</li>
+                    <li>偏移：5。</li>
+                    <li>特征码：无。</li>
+                </ul>
+            </li>
+            <li><strong>O{检查 dcid_len > QUIC_MAX_CID_LENGTH?}</strong>：
+                <ul>
+                    <li>变量：<code>dcid_len</code>。</li>
+                    <li>验证逻辑：如果 DCID 长度超过了最大允许的 CID 长度 (20 字节)，则不是有效的 QUIC 报文。</li>
+                </ul>
+            </li>
+            <li><strong>P{检查当前偏移量 + dcid_len 是否超出报文捕获长度?}</strong>：
+                <ul>
+                    <li>变量：<code>offset + dcid_len</code>。</li>
+                    <li>验证逻辑：防止越界读取，确保数据包中有足够的字节来读取整个 DCID。</li>
+                </ul>
+            </li>
+            <li><strong>Q{读取 SCID 长度 scid_len (1字节, 偏移 5 + 1 + dcid_len)}</strong>：
+                <ul>
+                    <li>数据长度：1 字节。</li>
+                    <li>偏移：<code>5 + 1 + dcid_len</code> (version之后，DCIL和DCID之后)。</li>
+                    <li>特征码：无。</li>
+                </ul>
+            </li>
+            <li><strong>R{检查 scid_len > QUIC_MAX_CID_LENGTH?}</strong>：
+                <ul>
+                    <li>变量：<code>scid_len</code>。</li>
+                    <li>验证逻辑：如果 SCID 长度超过了最大允许的 CID 长度 (20 字节)，则不是有效的 QUIC 报文。</li>
+                </ul>
+            </li>
+            <li><strong>K[是QUIC，调用 dissect_quic 进行解析]</strong>：通过启发式检查，确认为 QUIC 协议，将其交给 QUIC 解析器进行详细解析。</li>
+            <li><strong>D[不是QUIC，返回]</strong>：不符合 QUIC 协议的特征，返回并尝试其他启发式解析器。</li>
+        </ul>
+    </div>
+
+    <div class="section">
+        <h2>2. 关键宏定义</h2>
+        <ul>
+            <li><code>QUIC_MAX_CID_LENGTH</code> (定义在 quic.h 中, 代码中没有直接给出，但通常为 20)：最大连接 ID 长度。</li>
+            <li><code>0x80</code>：用于判断 Long Header (最高位为 1) 或 Short Header (最高位为 0) 的特征码。</li>
+            <li><code>0xff0000</code>：用于识别 IETF 草案版本号的模式，例如 <code>0xff000015</code> (draft-21)。</li>
+            <li><code>0x0F0F0F0F</code> 和 <code>0x0a0a0a0a</code>：用于识别强制版本协商（GREASE）的特征码。</li>
+            <li><code>0x00000000</code>：表示版本协商包的版本号。</li>
+            <li><code>0x00000001</code>：表示 QUIC v1 的版本号。</li>
+            <li><code>0x6b3343cf</code>：表示 QUIC v2 的版本号。</li>
+            <li><code>0xfaceb001</code>, <code>0xfaceb002</code>, <code>0xfaceb00e</code>：Facebook mvfst 版本的特征码。</li>
+            <li><code>0x51303530</code> (Google Q050), <code>0x54303530</code> (Google T050), <code>0x54303531</code> (Google T051)：Google QUIC 版本的特征码。</li>
+        </ul>
+    </div>
+
+    <div class="section">
+        <h2>3. 检测方法总结</h2>
+        <p>Wireshark 的 QUIC 启发式识别主要基于报文的第一个字节（Flag 字段）和版本号，以及 Connection ID 的长度和格式，以区分 Long Header 和 Short Header 报文，并进一步验证其是否符合 QUIC 协议的特定结构。</p>
+
+        <h3>3.1. Long Header 报文检测</h3>
+        <p>Long Header 报文通常是 QUIC 连接的初始阶段（如 Initial、Handshake、0-RTT、Retry）或版本协商报文。</p>
+        <h4>数据结构：</h4>
+        <pre>
+偏移量  长度  字段名              说明
+0       1     Flags               最高位 (0x80) 为 1，表示 Long Header
+1       4     Version             QUIC 版本号
+5       1     DCID Length (DCIL)  目标连接 ID 长度 (0-20字节)
+6      DCIL   Destination CID     目标连接 ID
+6+DCIL  1     SCID Length (SCIL)  源连接 ID 长度 (0-20字节)
+7+DCIL SCIL   Source CID          源连接 ID
+...     ...   (根据 Packet Type)   后续字段
+        </pre>
+        <h4>样例数据 (Initial Packet - 伪造):</h4>
+        <pre>
+17 00 00 00 01  // Flags (0x17), Version (0x00000001, v1)
+08              // DCID Length (8)
+d0 62 13 42 d8 82 05 91  // Destination Connection ID (8字节)
+00              // SCID Length (0)
+...             // 后续Payload
+        </pre>
+        <h4>验证逻辑：</h4>
+        <ul>
+            <li><strong>报文长度检查：</strong> 报文总长度必须大于等于 13 字节，这是 Long Header 的基本结构要求（Flags + Version + DCIL + DCID + SCIL + SCID 的最小组合）。</li>
+            <li><strong>Flag 检查：</strong> 报文的第一个字节的最高位 (0x80) 必须为 1。</li>
+            <li><strong>版本号检查：</strong>
+                <ul>
+                    <li>读取偏移量为 1 的 4 字节作为版本号。</li>
+                    <li>如果版本号为 <code>0x00000000</code>，则认为是版本协商包。</li>
+                    <li>否则，调用 <code>quic_draft_version</code> 函数判断版本号是否为已知的 QUIC 草案版本或最终版本（v1, v2），且草案号大于等于 11。</li>
+                    <li>识别的合法版本号包括：IETF 草案版本（<code>0xff0000xx</code> 模式）、QUIC v1 (<code>0x00000001</code>)、QUIC v2 (<code>0x6b3343cf</code>)、Facebook mvfst 和 Google QUIC 的特定版本。</li>
+                </ul>
+            </li>
+            <li><strong>Connection ID 长度检查：</strong>
+                <ul>
+                    <li>读取 DCID Length (DCIL) 和 SCID Length (SCIL) 字节。</li>
+                    <li>DCIL 和 SCIL 都不能超过 <code>QUIC_MAX_CID_LENGTH</code>（通常是 20 字节）。</li>
+                    <li>确保读取 DCID 和 SCID 时不会超出报文的捕获长度。</li>
+                </ul>
+            </li>
+        </ul>
+
+        <h3>3.2. Short Header 报文检测</h3>
+        <p>Short Header 报文通常用于 1-RTT 应用数据传输，其 Connection ID 长度是可变的，甚至可以是 0 字节。这使得启发式识别更具挑战性，因为它依赖于之前建立的连接上下文。</p>
+        <h4>数据结构：</h4>
+        <pre>
+偏移量  长度  字段名              说明
+0       1     Flags               最高位 (0x80) 为 0，表示 Short Header
+1      变长   Destination CID     目标连接 ID (长度未知，取决于协商)
+...     ...   Packet Number       加密后的包号 (长度未知，1, 2 或 4字节)
+...     ...   Protected Payload   加密后的负载
+        </pre>
+        <h4>样例数据 (Short Header Packet - 伪造):</h4>
+        <pre>
+40              // Flags (0x40, Fixed Bit set, Short Header)
+d0 62 13 42 d8 82 05 91  // Destination Connection ID (假设8字节，实际协商而定)
+89 12           // Encrypted Packet Number (假设2字节，实际加密)
+...             // Encrypted Payload
+        </pre>
+        <h4>验证逻辑：</h4>
+        <ul>
+            <li><strong>报文长度检查：</strong> 报文总长度必须大于等于 <code>1 (Flags) + 1 (DCID 最小长度) + 1 (PN 最小长度) + 16 (认证标签最小长度) = 19</code> 字节。代码中直接检查总长是否小于 <code>1 + 1 + 1 + 16 = 19</code> 字节，即 <code>tvb_captured_length(tvb) < 19</code>。</li>
+            <li><strong>Flag 检查：</strong> 报文的第一个字节的最高位 (0x80) 必须为 0。</li>
+            <li><strong>已知 CID 长度检查：</strong> <code>quic_cid_lengths</code> 必须不为 0。这意味着在当前捕获中已经至少有一个 QUIC 连接被完全识别，并且其 Connection ID 长度已被记录。这是 Short Header 启发式识别的关键前提。</li>
+            <li><strong>DCID 匹配：</strong> 提取报文偏移 1 处的最多 <code>QUIC_MAX_CID_LENGTH</code> 字节作为潜在的 DCID。然后，在已建立的 QUIC 连接中，尝试查找与该 DCID 匹配的连接。由于 Short Header 的 DCID 长度是动态的，这里会尝试所有已知的 CID 长度进行匹配。如果找到匹配，则认为该报文是 QUIC。</li>
+            <li><strong>GSO 启发式优化：</strong> <code>quic_gso_heur_dcid_len</code> 偏好设置允许用户配置最小 DCID 长度，当 DCID 长度达到该值时，会尝试在报文的其他位置查找重复的 DCID 来进一步确认是否为 GSO 分段导致的合并包。如果启用了该优化且匹配成功，也会被识别为 QUIC。</li>
+        </ul>
+    </div>
+
+    <div class="section">
+        <h2>4. 协议识别相关源代码 (启发式函数)</h2>
+        <pre>
+static bool dissect_quic_heur(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data)
+{
+    /*
+     * Since draft -22:
+     * Flag (1 byte) + Version (4 bytes) +
+     * Length (1 byte) + Destination Connection ID (0..255) +
+     * Length (1 byte) + Source Connection ID (0..255) +
+     * Payload length (1/2/4/8) + Packet number (1/2/4 bytes) + Payload.
+     * (absolute minimum: 9 + payload)
+     * (for Version Negotiation, payload len + PKN + payload is replaced by
+     * Supported Version (multiple of 4 bytes.)
+     */
+    conversation_t *conversation = NULL;
+    int offset = 0;
+    uint8_t flags, dcid, scid;
+    uint32_t version;
+    bool is_quic = false;
+
+    /* Verify packet size  (Flag (1 byte) + Connection ID (8 bytes) + Version (4 bytes)) */
+    if (tvb_captured_length(tvb) < 13)
+    {
+        return false;
+    }
+
+    flags = tvb_get_uint8(tvb, offset);
+    /* Check if long Packet is set */
+    if((flags & 0x80) == 0) {
+        // Perhaps this is a short header, check it.
+        return dissect_quic_short_header_heur(tvb, pinfo, tree);
+    }
+    offset += 1;
+
+    // check for draft QUIC version (for draft -11 and newer)
+    version = tvb_get_ntohl(tvb, offset);
+    is_quic = (quic_draft_version(version) >= 11);
+    if (!is_quic) {
+        return false;
+    }
+
+    /* Check that CIDs lengths are valid */
+    offset += 4;
+    dcid = tvb_get_uint8(tvb, offset);
+    if (dcid > QUIC_MAX_CID_LENGTH) {
+        return false;
+    }
+    offset += 1 + dcid;
+    if (offset >= (int)tvb_captured_length(tvb)) {
+        return false;
+    }
+    scid = tvb_get_uint8(tvb, offset);
+    if (scid > QUIC_MAX_CID_LENGTH) {
+        return false;
+    }
+
+    /* Ok! */
+    conversation = find_or_create_conversation(pinfo);
+    conversation_set_dissector(conversation, quic_handle);
+    dissect_quic(tvb, pinfo, tree, data);
+
+    return true;
+}
+
+static bool
+dissect_quic_short_header_heur(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree)
+{
+    // If this capture does not contain QUIC, skip the more expensive checks.
+    if (quic_cid_lengths == 0) {
+        return false;
+    }
+
+    // Is this a SH packet after connection migration? SH (since draft -22):
+    // Flag (1) + DCID (1-20) + PKN (1/2/4) + encrypted payload (>= 16).
+    if (tvb_captured_length(tvb) < 1 + 1 + 1 + 16) {
+        return false;
+    }
+
+    // DCID length is unknown, so extract the maximum and look for a match.
+    quic_cid_t dcid = {.len = MIN(QUIC_MAX_CID_LENGTH, tvb_captured_length(tvb) - 1 - 1 - 16)};
+    tvb_memcpy(tvb, dcid.cid, 1, dcid.len);
+    bool from_server;
+    if (!quic_connection_find(pinfo, QUIC_SHORT_PACKET, &dcid, &from_server)) {
+        return false;
+    }
+
+    conversation_t *conversation = find_or_create_conversation(pinfo);
+    conversation_set_dissector(conversation, quic_handle);
+    dissect_quic(tvb, pinfo, tree, NULL);
+    return true;
+}
+        </pre>
+    </div>
+</body>
+</html>

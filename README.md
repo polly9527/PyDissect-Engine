@@ -48,7 +48,7 @@
 ├── detectors/              # [最终产物] 存放 AI 生成的 Python 解析器 (*.py)
 ├── log/                    # [日志] 存放检测引擎的运行日志和错误日志
 ├── traffic_detector_v2.py  # [核心] 实时流量检测引擎
-├── batch_generate_protocol_analysis_and_rules_v2.py # [核心] AI 规则生成工厂
+├── batch_generate_protocol_analysis_and_detectors_v2.py # [核心] AI 规则生成工厂
 ├── 自定义协议解析器编写说明.html # 手动编写解析器的规范文档
 ├── README.md               # 本文档
 └── requirements.txt        # Python 依赖列表

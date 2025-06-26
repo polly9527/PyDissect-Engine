@@ -1,0 +1,10 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# 将特定文件标记为某种语言
+*.js linguist-language=JavaScript
+*.py linguist-language=Python
+
+# 忽略某些文件以不影响语言统计
+*.md linguist-detectable=false
+/dissectors/* linguist-detectable=false

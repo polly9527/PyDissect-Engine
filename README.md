@@ -102,7 +102,7 @@ GEMINI_API_KEY="YOUR_API_KEY_HERE"
 1.  **准备源码**: 将您想要支持的协议的 Wireshark 解析器 C 源码文件（例如 `packet-dns.c`）放入 `dissectors` 文件夹。
 2.  **运行规则工厂**:
     ```bash
-    python batch_generate_protocol_analysis_and_rules_v2.py
+    python batch_generate_protocol_analysis_and_detectors_v2.py
     ```
     脚本会自动执行两个步骤：
     - 首先，在 `protocol_analysis` 目录生成 HTML 分析报告。

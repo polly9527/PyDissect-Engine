@@ -1,0 +1,170 @@
+```html
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>TLS 协议解析器分析</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+    <style>
+        body {
+            font-family: sans-serif;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 1em;
+        }
+        th, td {
+            border: 1px solid #ddd;
+            padding: 0.5em;
+            text-align: left;
+        }
+        th {
+            background-color: #f0f0f0;
+        }
+        pre {
+            background-color: #eee;
+            padding: 1em;
+            overflow: auto;
+        }
+        .mermaid {
+            margin-bottom: 1em;
+        }
+    </style>
+</head>
+<body>
+
+<h1>TLS 协议解析器分析</h1>
+
+<h2>TLS 协议启发式识别分析（单包）</h2>
+
+<h3>Mermaid 流程图</h3>
+
+<div class="mermaid">
+graph TD
+    A[开始] --> B{数据长度 > 4?};
+    B -- 是 --> C{前4字节是否可打印ASCII字符?};
+    C -- 是 --> D[不是TLS，返回0];
+    C -- 否 --> E{是否看起来像SSLv2?};
+    E -- 是 --> F[调用SSLv2解析器];
+    E -- 否 --> G{是否看起来像SSLv3/TLS?};
+    G -- 是 --> H[调用SSLv3/TLS解析器];
+    G -- 否 --> I[视为后续数据];
+    B -- 否 --> J[数据不足，返回0];
+    D --> K[结束];
+    F --> K;
+    H --> K;
+    I --> K;
+    J --> K;
+
+</div>
+
+
+<h3>关键宏定义</h3>
+
+<table>
+    <thead>
+        <tr>
+            <th>宏定义</th>
+            <th>说明</th>
+        </tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td><code>SSLV3_VERSION</code>, <code>TLSV1_VERSION</code>, etc.</td>
+        <td>SSL/TLS版本号。</td>
+    </tr>
+    <tr>
+        <td><code>SSL_ID_HANDSHAKE</code>, <code>SSL_ID_APP_DATA</code>, etc.</td>
+        <td>SSL/TLS记录内容类型。</td>
+    </tr>
+        <tr>
+            <td><code>TLS_MAX_RECORD_LENGTH</code></td>
+            <td>TLS记录的最大长度。</td>
+        </tr>
+
+    </tbody>
+</table>
+
+<h3>检测方法总结</h3>
+
+该启发式检测方法首先检查数据包长度是否大于4字节。如果是，则检查前4字节是否为可打印ASCII字符。如果是，则认为不是TLS流量，返回0。否则，检查数据包是否看起来像SSLv2记录或SSLv3/TLS记录。如果是，则调用相应的解析器进行解析。如果两者都不是，则将数据视为后续数据。如果数据包长度小于等于4字节，则认为数据不足，返回0。
+
+样例数据 (SSLv3 Client Hello)：
+```
+16 03 00 00 9a  01 00 00 96 03 00 57 cf ef
+```
+
+
+<h3>启发式函数源码</h3>
+
+```c
+static bool
+dissect_ssl_heur(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data)
+{
+    conversation_t     *conversation;
+
+    if (!is_sslv3_or_tls(tvb) && !is_sslv2_clienthello(tvb)) {
+        return false;
+    }
+
+    conversation = find_or_create_conversation(pinfo);
+    conversation_set_dissector_from_frame_number(conversation, pinfo->num, tls_handle);
+    return dissect_ssl(tvb, pinfo, tree, data) > 0;
+}
+
+static bool
+is_sslv3_or_tls(tvbuff_t *tvb)
+{
+    // ... (代码略)
+}
+
+static bool
+is_sslv2_clienthello(tvbuff_t *tvb)
+{
+    // ... (代码略)
+}
+
+static int
+dissect_ssl(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_)
+{
+    // ... (代码略)
+}
+
+static int
+ssl_looks_like_sslv2(tvbuff_t *tvb, const uint32_t offset)
+{
+    // ... (代码略)
+}
+
+static int
+ssl_looks_like_sslv3(tvbuff_t *tvb, const uint32_t offset)
+{
+    // ... (代码略)
+}
+
+```
+
+
+<h2>TLS 解析器高级功能分析</h2>
+
+该代码包含 TCP 流重组和会话跟踪等高级功能。
+
+TCP 流重组通过 `ssl_reassembly_table` 和 `tls_hs_reassembly_table` 两个重组表实现。`ssl_reassembly_table` 用于重组 TLS 记录，`tls_hs_reassembly_table` 用于重组 TLS 握手消息。代码中 `desegment_ssl` 函数负责处理 TLS 数据的重组。如果一个 TLS 记录或握手消息跨越多个 TCP 段，`desegment_ssl` 函数会将这些段重新组合成一个完整的记录或消息，然后传递给相应的解析器进行解析。
+
+
+会话跟踪通过 `conversation_t` 结构体实现。`conversation_t` 结构体存储了会话的相关信息，例如客户端和服务器的地址和端口号、SSL/TLS 版本号、加密套件等。代码中使用 `find_conversation` 或 `find_or_create_conversation` 函数来查找或创建会话。通过会话跟踪，可以将属于同一会话的多个数据包关联起来，以便进行解密和解析。
+
+
+
+<h2>TLS 协议端口注册信息</h2>
+
+代码中使用 `ssl_associations` 表来注册端口和对应的解析器。 该表是一个动态表，可以通过 `ssl_dissector_add` 和 `ssl_dissector_delete` 函数来添加和删除端口关联。代码本身并没有硬编码注册任何标准端口。Wireshark 在初始化时会根据用户配置将标准端口 (例如 443) 与 TLS 解析器关联起来.  此部分需要查看 Wireshark 的初始化代码和用户配置才能确定实际注册的端口。
+
+
+</body>
+</html>
+```
+
+
+注意：由于代码篇幅较长，上述代码部分均为节选，并用 `// ... (代码略)` 代替了省略的部分。 流程图也进行了简化，只保留了主要的判断逻辑。完整的分析需要阅读全部代码。

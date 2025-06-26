@@ -2,3 +2,4 @@ Prompt.txt
 /log
 .env
 .gitattributes
+.gitignore

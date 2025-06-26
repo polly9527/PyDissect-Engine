@@ -8,3 +8,4 @@
 # 忽略某些文件以不影响语言统计
 *.md linguist-detectable=false
 /dissectors/* linguist-detectable=false
+/protocol_analysis/* linguist-detectable=false
